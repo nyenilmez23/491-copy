@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -11,6 +11,14 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import * as Crypto from 'expo-crypto';
 import * as DocumentPicker from 'expo-document-picker';
+import {
+  getRecordingPermissionsAsync,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  useAudioRecorder,
+  useAudioRecorderState,
+} from 'expo-audio';
+import { File } from 'expo-file-system';
 
 import type {
   RecordingMode,
@@ -19,6 +27,12 @@ import type {
 } from './src/api/types';
 import { MAX_AUDIO_BYTES } from './src/api/types';
 import { uploadTake } from './src/api/uploadTake';
+import type { WavInspection } from './src/recording/inspectWav';
+import { describeWav, inspectWav } from './src/recording/inspectWav';
+import {
+  WAV_RECORDING_OPTIONS,
+  recordingOptionsForTake,
+} from './src/recording/recordingOptions';
 
 type UploadPhase = 'idle' | 'uploading' | 'success' | 'error';
 
@@ -33,6 +47,13 @@ function formatBytes(size: number | null): string {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatDuration(millis: number): string {
+  const totalSeconds = Math.floor(millis / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 function formatResponse(result: UploadTakeResponse | null): string {
@@ -68,6 +89,112 @@ export default function App() {
     null,
   );
   const [localError, setLocalError] = useState<string | null>(null);
+  const recorder = useAudioRecorder(WAV_RECORDING_OPTIONS);
+  const pendingIdsRef = useRef<{ projectId: string; takeId: string } | null>(
+    null,
+  );
+  const recorderState = useAudioRecorderState(recorder);
+  const [recorderBusy, setRecorderBusy] = useState(false);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+  const [recordedWav, setRecordedWav] = useState<WavInspection | null>(null);
+  const isRecording = recorderState.isRecording;
+
+  async function ensureMicrophonePermission(): Promise<boolean> {
+    let permission = await getRecordingPermissionsAsync();
+    if (!permission.granted && permission.canAskAgain) {
+      permission = await requestRecordingPermissionsAsync();
+    }
+    if (permission.granted) {
+      return true;
+    }
+    setRecordingError(
+      permission.canAskAgain
+        ? 'Microphone access was not allowed. Tap Record and allow access to record a take.'
+        : 'Microphone access is turned off for this app. Turn it on in Settings > Privacy & Security > Microphone, then tap Record again.',
+    );
+    return false;
+  }
+
+  async function handleRecord() {
+    setRecordingError(null);
+    setLocalError(null);
+    setRecorderBusy(true);
+
+    try {
+      if (!(await ensureMicrophonePermission())) {
+        return;
+      }
+
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      // Each new recording is a new take, so it gets new IDs. The file is
+      // named after the take ID and kept in app document storage.
+      const projectId = Crypto.randomUUID();
+      const takeId = Crypto.randomUUID();
+      pendingIdsRef.current = { projectId, takeId };
+      await recorder.prepareToRecordAsync(recordingOptionsForTake(takeId));
+      recorder.record();
+    } catch (error) {
+      pendingIdsRef.current = null;
+      setRecordingError(
+        error instanceof Error
+          ? `Could not start recording: ${error.message}`
+          : 'Could not start recording.',
+      );
+    } finally {
+      setRecorderBusy(false);
+    }
+  }
+
+  async function handleStop() {
+    setRecordingError(null);
+    setRecorderBusy(true);
+
+    try {
+      await recorder.stop();
+      await setAudioModeAsync({ allowsRecording: false }).catch(() => {});
+
+      const ids = pendingIdsRef.current;
+      pendingIdsRef.current = null;
+      const uri = recorder.uri;
+      if (!ids || !uri) {
+        setRecordingError('Recording stopped, but no file was saved.');
+        return;
+      }
+
+      const file = new File(uri);
+      const size = file.exists ? file.size : 0;
+      if (size <= 0) {
+        setRecordingError('Recording stopped, but the saved file is empty.');
+        return;
+      }
+
+      setRecordedWav(inspectWav(uri));
+      setSelectedAudio({
+        uri,
+        name: file.name,
+        size,
+        mimeType: 'audio/wav',
+        projectId: ids.projectId,
+        takeId: ids.takeId,
+      });
+      setPhase('idle');
+      setUploadResult(null);
+
+      if (size > MAX_AUDIO_BYTES) {
+        setLocalError(
+          `Recording exceeds the ${MAX_AUDIO_BYTES} byte (32 MiB) upload limit. Record a shorter take.`,
+        );
+      }
+    } catch (error) {
+      setRecordingError(
+        error instanceof Error
+          ? `Could not stop recording: ${error.message}`
+          : 'Could not stop recording.',
+      );
+    } finally {
+      setRecorderBusy(false);
+    }
+  }
 
   async function handleSelectAudio() {
     setLocalError(null);
@@ -103,6 +230,7 @@ export default function App() {
       return;
     }
 
+    setRecordedWav(null);
     setSelectedAudio({
       uri: asset.uri,
       name: asset.name,
@@ -147,6 +275,11 @@ export default function App() {
     setPhase(result.ok ? 'success' : 'error');
   }
 
+  const canRecord = !isRecording && !recorderBusy && phase !== 'uploading';
+  const canStop = isRecording && !recorderBusy;
+  const uploadDisabled =
+    phase === 'uploading' || !selectedAudio || isRecording || recorderBusy;
+
   const statusLabel =
     phase === 'uploading'
       ? 'Uploading…'
@@ -167,23 +300,47 @@ export default function App() {
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Recording</Text>
-          <Text style={styles.hint}>
-            Microphone recording is not connected yet. These controls are
-            placeholders for Emir’s recording module.
-          </Text>
           <View style={styles.modeRow}>
-            <Pressable style={[styles.modeButton, styles.placeholderButton]} disabled>
-              <Text style={[styles.modeButtonText, styles.placeholderButtonText]}>
+            <Pressable
+              style={[styles.modeButton, !canRecord && styles.placeholderButton]}
+              onPress={handleRecord}
+              disabled={!canRecord}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  !canRecord && styles.placeholderButtonText,
+                ]}
+              >
                 Record
               </Text>
             </Pressable>
-            <Pressable style={[styles.modeButton, styles.placeholderButton]} disabled>
-              <Text style={[styles.modeButtonText, styles.placeholderButtonText]}>
+            <Pressable
+              style={[styles.modeButton, !canStop && styles.placeholderButton]}
+              onPress={handleStop}
+              disabled={!canStop}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  !canStop && styles.placeholderButtonText,
+                ]}
+              >
                 Stop
               </Text>
             </Pressable>
           </View>
-          <Text style={styles.meta}>Status: Not connected</Text>
+          <Text style={styles.meta}>
+            Status:{' '}
+            {isRecording
+              ? `Recording ${formatDuration(recorderState.durationMillis)}`
+              : recorderBusy
+                ? 'Working…'
+                : 'Ready'}
+          </Text>
+          {recordingError ? (
+            <Text style={styles.errorText}>{recordingError}</Text>
+          ) : null}
         </View>
 
         <Text style={styles.label}>Recording mode</Text>
@@ -214,7 +371,14 @@ export default function App() {
           })}
         </View>
 
-        <Pressable style={styles.secondaryButton} onPress={handleSelectAudio}>
+        <Pressable
+          style={[
+            styles.secondaryButton,
+            (isRecording || recorderBusy) && styles.primaryButtonDisabled,
+          ]}
+          onPress={handleSelectAudio}
+          disabled={isRecording || recorderBusy}
+        >
           <Text style={styles.secondaryButtonText}>Select audio file</Text>
         </Pressable>
 
@@ -230,9 +394,29 @@ export default function App() {
                 project_id: {selectedAudio.projectId}
               </Text>
               <Text style={styles.meta}>take_id: {selectedAudio.takeId}</Text>
+              {recordedWav ? (
+                recordedWav.ok ? (
+                  <Text
+                    style={
+                      recordedWav.info.backendCompatible
+                        ? styles.meta
+                        : styles.errorText
+                    }
+                  >
+                    Format: {describeWav(recordedWav.info)}
+                    {recordedWav.info.backendCompatible
+                      ? ''
+                      : ' (not the mono 16-bit PCM WAV the backend expects)'}
+                  </Text>
+                ) : (
+                  <Text style={styles.errorText}>
+                    Format check failed: {recordedWav.reason}
+                  </Text>
+                )
+              ) : null}
               <Text style={styles.hint}>
-                Retrying this recording reuses these UUIDs. Selecting a new
-                file generates new ones.
+                Retrying this recording reuses these UUIDs. Selecting a file or
+                recording a new take generates new ones.
               </Text>
             </>
           ) : (
@@ -243,11 +427,10 @@ export default function App() {
         <Pressable
           style={[
             styles.primaryButton,
-            (phase === 'uploading' || !selectedAudio) &&
-              styles.primaryButtonDisabled,
+            uploadDisabled && styles.primaryButtonDisabled,
           ]}
           onPress={handleUpload}
-          disabled={phase === 'uploading' || !selectedAudio}
+          disabled={uploadDisabled}
         >
           {phase === 'uploading' ? (
             <ActivityIndicator color="#fff" />
