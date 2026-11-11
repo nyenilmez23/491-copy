@@ -1,0 +1,9 @@
+%%{init: {"theme":"base","themeVariables":{"darkMode":false,"background":"#ffffff","primaryColor":"#ffffff","mainBkg":"#ffffff","primaryBorderColor":"#000000","primaryTextColor":"#000000","textColor":"#000000","lineColor":"#000000","edgeLabelBackground":"#ffffff"}}}%%
+flowchart LR
+    Capture["Phone: record or import"] --> Local["Save original in local project"]
+    Local -->|"Upload saved take"| API["Python API"]
+    API <--> Store["Uploaded audio and results"]
+    API --> Process["Process take"]
+    Process -->|"Result"| API
+    API -->|"Status and result"| Review["Phone: review, play and export"]
+    Review -->|"Later: route edits"| API
